@@ -26,6 +26,7 @@ from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcess
 from torchtitan.components.optimizer import (
     OptimizersContainer,
     OptimizersInBackwardContainer,
+    register_bf16_optimizer_state_hook,
 )
 from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
@@ -423,6 +424,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # build optimizer after applying parallelisms to the model
         self.optimizers = config.optimizer.build(model_parts=self.model_parts)
+        if config.optimizer.bf16_optimizer_states:
+            if config.optimizer.name not in ("Adam", "AdamW"):
+                raise ValueError(
+                    f"bf16_optimizer_states is only supported for Adam/AdamW, "
+                    f"got optimizer '{config.optimizer.name}'"
+                )
+            if config.optimizer.implementation != "fused":
+                raise ValueError(
+                    f"bf16_optimizer_states requires fused implementation, "
+                    f"got '{config.optimizer.implementation}'"
+                )
+            register_bf16_optimizer_state_hook(self.optimizers)
         if model_spec.post_optimizer_build_fn is not None:
             model_spec.post_optimizer_build_fn(
                 self.optimizers, self.model_parts, parallel_dims

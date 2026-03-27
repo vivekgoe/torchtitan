@@ -27,6 +27,7 @@ from torchtitan.distributed import ParallelDims
 __all__ = [
     "OptimizersContainer",
     "OptimizersInBackwardContainer",
+    "register_bf16_optimizer_state_hook",
     "register_moe_load_balancing_hook",
 ]
 
@@ -85,6 +86,14 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         - 'foreach': Use some horizontal fusion of tensors for better performance.
         - 'for-loop': Use the default implementation for the optimizer (slowest).
         - more info: https://pytorch.org/docs/stable/optim.html
+        """
+
+        bf16_optimizer_states: bool = False
+        """
+        Store optimizer states (exp_avg, exp_avg_sq) in bfloat16 to reduce
+        memory usage. Requires fused implementation and Adam/AdamW optimizer.
+        The fused CUDA kernel handles mixed-precision (fp32 params + bf16
+        states) natively.
         """
 
     optimizers: list[T]
@@ -333,3 +342,50 @@ def register_moe_load_balancing_hook(
                 model_parts, parallel_dims=parallel_dims
             )
         )
+
+
+def register_bf16_optimizer_state_hook(
+    optimizers: OptimizersContainer,
+) -> None:
+    """Register a step pre-hook to create Adam optimizer states in bfloat16.
+
+    The hook pre-populates optimizer state before Adam's lazy initialization
+    runs, so that ``_init_group`` finds non-empty state and skips its own
+    fp32 allocation. The fused CUDA kernel then sees the dtype mismatch
+    between fp32 params and bf16 states, dispatching to the mixed-precision
+    kernel (``FusedAdamMathFunctorMP``).
+
+    Args:
+        optimizers: The optimizers container whose inner optimizers will
+            receive the pre-hook.
+    """
+
+    def _bf16_state_init_hook(
+        optimizer: Optimizer, args: tuple, kwargs: dict
+    ) -> None:
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                state = optimizer.state[p]
+                if len(state) == 0:
+                    state["step"] = (
+                        torch.zeros((), dtype=torch.float32, device=p.device)
+                        if group.get("capturable") or group.get("fused")
+                        else torch.tensor(0.0, dtype=torch.float32)
+                    )
+                    state["exp_avg"] = torch.zeros_like(
+                        p, dtype=torch.bfloat16, memory_format=torch.preserve_format
+                    )
+                    state["exp_avg_sq"] = torch.zeros_like(
+                        p, dtype=torch.bfloat16, memory_format=torch.preserve_format
+                    )
+                    if group.get("amsgrad"):
+                        state["max_exp_avg_sq"] = torch.zeros_like(
+                            p,
+                            dtype=torch.bfloat16,
+                            memory_format=torch.preserve_format,
+                        )
+
+    for optim in optimizers:
+        optim.register_step_pre_hook(_bf16_state_init_hook)
