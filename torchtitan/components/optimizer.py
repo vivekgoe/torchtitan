@@ -88,13 +88,26 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         - more info: https://pytorch.org/docs/stable/optim.html
         """
 
-        bf16_optimizer_states: bool = False
+        states_dtype: Literal["float32", "bfloat16"] = "float32"
         """
-        Store optimizer states (exp_avg, exp_avg_sq) in bfloat16 to reduce
-        memory usage. Requires fused implementation and Adam/AdamW optimizer.
-        The fused CUDA kernel handles mixed-precision (fp32 params + bf16
-        states) natively.
+        torch dtype for optimizer states (exp_avg, exp_avg_sq). Setting to
+        'bfloat16' reduces memory usage. Requires fused implementation and
+        Adam/AdamW optimizer. The fused CUDA kernel handles mixed-precision
+        (fp32 params + bf16 states) natively.
         """
+
+        def __post_init__(self):
+            if self.states_dtype == "bfloat16":
+                if self.name not in ("Adam", "AdamW"):
+                    raise ValueError(
+                        f"states_dtype='bfloat16' is only supported for Adam/AdamW, "
+                        f"got optimizer '{self.name}'"
+                    )
+                if self.implementation != "fused":
+                    raise ValueError(
+                        f"states_dtype='bfloat16' requires fused implementation, "
+                        f"got '{self.implementation}'"
+                    )
 
     optimizers: list[T]
     model_parts: list[nn.Module]
@@ -128,6 +141,8 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
             params = [p for p in model.parameters() if p.requires_grad]
             self.optimizers.append(optimizer_cls(params, **optimizer_kwargs))
             all_params.extend(params)
+        if config.states_dtype == "bfloat16":
+            register_bf16_optimizer_state_hook(self)
         self._validate_length(len(self.model_parts))
         self._post_init(all_params, optimizer_kwargs)
 
